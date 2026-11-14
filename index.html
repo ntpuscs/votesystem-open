@@ -48,6 +48,10 @@ button:disabled{opacity:.45;cursor:not-allowed}
 .card-title.ruled{padding-bottom:12px;border-bottom:1px solid var(--line)}
 .err{color:var(--no);font-size:14px;min-height:1.4em}
 .stamp{font-size:14px;color:var(--yes);border:1px solid var(--yes);padding:5px 12px;white-space:nowrap}
+.integ{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;font-size:14px;line-height:1.7;padding:10px 14px;border:1px solid var(--line);background:#F6F7F9}
+.integ.ok{color:var(--yes)}
+.integ.bad{color:#7F1D1D;background:#FEF2F2;border-color:var(--no)}
+.integ ul{margin:4px 0 0;padding-left:20px}
 .topbar{background:var(--navy);color:#fff}
 .topbar .btn{background:transparent;color:#fff;border-color:var(--navy-line);min-height:44px}
 .topbar .btn.light{background:#fff;color:var(--navy);border-color:#fff;font-weight:700}
@@ -449,6 +453,7 @@ function Admin() {
         <section id="current"></section>
         <section class="card" style="display:flex;flex-direction:column;gap:14px">
           <h2 class="card-title">表決紀錄</h2>
+          <div id="integ"></div>
           <div class="table-box"><table>
             <thead><tr><th>開始時間</th><th>議案</th><th>方式</th><th>門檻</th><th>出席</th><th>贊成／反對／棄權</th><th>未投</th><th>結果</th></tr></thead>
             <tbody id="hist"></tbody>
@@ -492,6 +497,26 @@ function Admin() {
       c.disabled = true;
       act('setPresence', { account: c.dataset.acct, present: c.checked });
     });
+  }
+
+  function renderIntegrity() {
+    const r = data.integrity, el = $('#integ');
+    if (!r) { el.innerHTML = ''; return; }
+    const t = new Date(r.at).toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+    const legacy = r.log.legacy + r.detail.legacy;
+    const btn = '<button class="btn sm" id="reverify" type="button">重新驗證</button>';
+    if (r.ok) {
+      el.innerHTML = `<div class="integ ok"><span>✓ 紀錄完整：表決紀錄、記名明細、操作紀錄的簽章全部相符（${t} 檢查）${legacy ? `<span class="muted">；另有 ${legacy} 筆啟用簽章前的舊紀錄無法驗證</span>` : ''}</span>${btn}</div>`;
+    } else {
+      const items = [];
+      [['log', '表決紀錄'], ['detail', '記名明細'], ['audit', '操作紀錄']].forEach(([k, n]) => {
+        if (r[k].bad.length) items.push(`「${n}」第 ${r[k].bad.join('、')} 列內容與簽章不符`);
+        if (r[k].tail) items.push(`「${n}」筆數或最後一筆與系統紀錄不符（可能有紀錄被刪除或插入）`);
+      });
+      el.innerHTML = `<div class="integ bad"><div><b>⚠ 偵測到紀錄可能遭人直接修改試算表（${t} 檢查）</b><ul>${items.map(x => `<li>${esc(x)}</li>`).join('')}</ul>
+        請到試算表「檔案 → 版本記錄 → 查看版本記錄」查看修改者與時間，並以操作紀錄核對。</div>${btn}</div>`;
+    }
+    $('#reverify').onclick = () => act('verify');
   }
 
   function renderHistory() {
@@ -655,6 +680,7 @@ function Admin() {
     data = r;
     renderMembers();
     renderHistory();
+    renderIntegrity();
     renderCurrent();
   }
 

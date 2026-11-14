@@ -14,6 +14,11 @@ const SHEET_DETAIL = '記名明細';
 const STATE_KEY = 'VOTE_STATE';
 const RULES = ['簡單多數決', '出席過半數', '出席三分之二', '全體過半數', '全體三分之二'];
 const ADMIN_TTL_MS = 12 * 60 * 60 * 1000; // 秘書處登入有效 12 小時
+const SHEET_AUDIT = '操作紀錄';
+const TOKEN_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const MAX_FAILS = 8;          // 連續輸錯幾次密碼後鎖定
+const LOCK_SEC = 600;         // 鎖定 10 分鐘
+const PLACEHOLDER_PW = ['請改成密碼', '請自訂', ''];   // 範本預設密碼一律不接受
 
 /* ───────────── 初始化 ───────────── */
 
@@ -27,9 +32,30 @@ function setup() {
     [['秘書處密碼', '請改成密碼'], ['會議名稱', '（會議名稱）']]);
   ensureSheet_(ss, SHEET_LOG,
     ['表決編號', '開始時間', '截止時間', '議案編號', '表決事項', '案別', '方式', '門檻',
-     '出席人數', '全體人數', '贊成/同意', '反對/不同意', '棄權', '未投票', '結果', '結果說明']);
+     '出席人數', '全體人數', '贊成/同意', '反對/不同意', '棄權', '未投票', '結果', '結果說明', '簽章']);
   ensureSheet_(ss, SHEET_DETAIL,
-    ['表決編號', '議案編號', '表決事項', '選區', '姓名', '投票']);
+    ['表決編號', '議案編號', '表決事項', '選區', '姓名', '投票', '簽章']);
+  ensureSheet_(ss, SHEET_AUDIT, ['時間', '操作', '內容', '工作階段', '簽章']);
+  signKey_();
+  // 紀錄類工作表設為「僅擁有者可編輯」；系統以擁有者身分寫入，不受影響
+  [SHEET_LOG, SHEET_DETAIL, SHEET_AUDIT].forEach(function (n) { protect_(ss.getSheetByName(n)); });
+}
+
+function protect_(sh) {
+  try {
+    const me = Session.getEffectiveUser();
+    const p = sh.protect().setDescription('議會表決系統：僅擁有者可編輯，請勿手動修改');
+    p.addEditor(me);
+    p.removeEditors(p.getEditors().filter(function (u) { return u.getEmail() !== me.getEmail(); }));
+    if (p.canDomainEdit()) p.setDomainEdit(false);
+  } catch (e) { /* 個人帳號或權限不足時略過 */ }
+}
+
+/** 在 Apps Script 編輯器手動執行：檢查所有紀錄是否遭修改，結果顯示在「執行紀錄」 */
+function verifyRecords() {
+  const r = integrity_(true);
+  Logger.log(JSON.stringify(r, null, 2));
+  return r;
 }
 
 function ensureSheet_(ss, name, header, samples) {
@@ -69,9 +95,8 @@ function doPost(e) {
 }
 
 function doGet(e) {
-  const params = (e && e.parameter) || {};
-  if (!params.action) params.action = 'screen';
-  return doPost({ postData: { contents: JSON.stringify(params) } });
+  // 只開放公開的投影畫面資料；登入與所有操作一律走 POST，避免密碼、token 出現在網址與瀏覽紀錄
+  return doPost({ postData: { contents: JSON.stringify({ action: 'screen' }) } });
 }
 
 function handle_(req) {
@@ -95,21 +120,26 @@ function handle_(req) {
     case 'vote':
       return withLock_(function (s) { return vote_(s, req); });
     case 'logout':
-      return withLock_(function (s) { delete s.tokens[req.token]; return { ok: true }; });
+      return withLock_(function (s) { if (lookup_(s.tokens, req.token)) delete s.tokens[req.token]; return { ok: true }; });
 
     /* 秘書處 */
     case 'adminLogin':
       return withLock_(function (s) { return adminLogin_(s, req); });
     case 'adminLogout':
-      return withLock_(function (s) { delete s.admins[req.adminToken]; return { ok: true }; });
+      return withLock_(function (s) {
+        if (lookup_(s.admins, req.adminToken)) { delete s.admins[req.adminToken]; audit_('秘書處登出', '', req.adminToken); }
+        return { ok: true };
+      });
     case 'admin':
       requireAdmin_(st, req.adminToken);
       return admin_(st);
     case 'setPresence':
       return withLock_(function (s) {
         requireAdmin_(s, req.adminToken);
-        if (!council_().some(function (m) { return m.account === req.account; })) throw new Error('查無此議員');
-        s.attendance[req.account] = !!req.present;
+        const m = council_().find(function (x) { return x.account === req.account; });
+        if (!m) throw new Error('查無此議員');
+        s.attendance[m.account] = req.present === true;
+        audit_(req.present === true ? '確認出席' : '取消出席', m.name + '（' + m.account + '）', req.adminToken);
         return { ok: true };
       });
     case 'resetAttendance':
@@ -119,6 +149,7 @@ function handle_(req) {
         s.attendance = {};
         s.tokens = {};
         s.vote = null;
+        audit_('清除全部簽到', '', req.adminToken);
         return { ok: true };
       });
     case 'start':
@@ -129,19 +160,23 @@ function handle_(req) {
         if (!s.vote || s.vote.status !== 'voting') throw new Error('目前沒有進行中的表決');
         const sec = Math.min(300, Math.max(5, Number(req.seconds) || 30));
         s.vote.endsAt += sec * 1000;
+        audit_('延長表決', s.vote.id + ' 延長 ' + sec + ' 秒', req.adminToken);
         return { ok: true };
       });
     case 'stop':
       return withLock_(function (s) {
         requireAdmin_(s, req.adminToken);
         if (!s.vote || s.vote.status !== 'voting') throw new Error('目前沒有進行中的表決');
-        closeVote_(s);
+        closeVote_(s, '秘書處立即截止', req.adminToken);
         return { ok: true };
       });
     case 'reloadCouncil':
       requireAdmin_(st, req.adminToken);
-      CacheService.getScriptCache().removeAll(['council', 'settings', 'history']);
+      CacheService.getScriptCache().removeAll(['council', 'settings', 'history', 'integrity']);
       return { ok: true };
+    case 'verify':
+      requireAdmin_(st, req.adminToken);
+      return { ok: true, integrity: integrity_(true) };
 
     default:
       throw new Error('未知的操作');
@@ -169,7 +204,7 @@ function withLock_(fn) {
   lock.waitLock(15000);
   try {
     const st = loadState_();
-    if (st.vote && st.vote.status === 'voting' && Date.now() >= st.vote.endsAt) closeVote_(st);
+    if (st.vote && st.vote.status === 'voting' && Date.now() >= st.vote.endsAt) closeVote_(st, '時間到自動截止', '');
     const out = fn(st);
     saveState_(st);
     return out;
@@ -188,7 +223,7 @@ function council_() {
   if (!sh) throw new Error('找不到「議員」工作表，請先執行 setup()');
   const rows = sh.getDataRange().getDisplayValues().slice(1);
   const list = rows
-    .filter(function (r) { return String(r[0]).trim(); })
+    .filter(function (r) { const a = String(r[0]).trim(); return a && !(a in Object.prototype); })
     .map(function (r, i) {
       return {
         account: String(r[0]).trim(),
@@ -243,10 +278,16 @@ function history_() {
 /* ───────────── 議員 ───────────── */
 
 function login_(st, req) {
-  const account = String(req.account || '').trim();
+  const account = String(req.account || '').trim().slice(0, 100);
   const password = String(req.password || '');
+  const key = 'u_' + account;
+  checkLock_(key);
   const m = council_().find(function (x) { return x.account === account; });
-  if (!m || !password || m.password !== password) throw new Error('帳號或密碼錯誤');
+  if (!m || !password || PLACEHOLDER_PW.indexOf(m.password) >= 0 || m.password !== password) {
+    fail_(key);
+    throw new Error('帳號或密碼錯誤');
+  }
+  clearFails_(key);
   // 同一帳號只保留最新一台裝置
   Object.keys(st.tokens).forEach(function (t) { if (st.tokens[t] === account) delete st.tokens[t]; });
   const token = Utilities.getUuid();
@@ -256,7 +297,7 @@ function login_(st, req) {
 }
 
 function me_(st, token) {
-  const account = st.tokens[token];
+  const account = lookup_(st.tokens, token);
   if (!account) throw new Error('AUTH');
   const m = council_().find(function (x) { return x.account === account; });
   if (!m) throw new Error('AUTH');
@@ -282,7 +323,7 @@ function me_(st, token) {
 }
 
 function vote_(st, req) {
-  const account = st.tokens[req.token];
+  const account = lookup_(st.tokens, req.token);
   if (!account) throw new Error('AUTH');
   const v = st.vote;
   if (!v) throw new Error('目前沒有進行中的表決');
@@ -303,22 +344,60 @@ function vote_(st, req) {
 
 function adminLogin_(st, req) {
   const pw = setting_('秘書處密碼');
-  if (!pw || String(req.password || '') !== pw) throw new Error('密碼錯誤');
+  if (pw.length < 8 || PLACEHOLDER_PW.indexOf(pw) >= 0) {
+    throw new Error('秘書處密碼尚未設定或少於 8 個字元，請先到試算表「設定」工作表修改');
+  }
+  checkLock_('admin');
+  if (String(req.password || '') !== pw) {
+    fail_('admin');
+    audit_('秘書處登入失敗', '', '');
+    throw new Error('密碼錯誤');
+  }
+  clearFails_('admin');
   const now = Date.now();
   Object.keys(st.admins).forEach(function (t) { if (st.admins[t] < now) delete st.admins[t]; });
   const token = Utilities.getUuid();
   st.admins[token] = now + ADMIN_TTL_MS;
+  audit_('秘書處登入', '', token);
   return { ok: true, adminToken: token };
 }
 
-function requireAdmin_(st, token) {
-  if (!token || !st.admins[token] || st.admins[token] < Date.now()) throw new Error('AUTH');
+/**
+ * 只接受「格式正確」且「確實存在」的 token。
+ * 舊版直接用 obj[token] 查詢，傳入 "constructor"、"__proto__" 等字串會取到物件內建屬性而誤判為有效。
+ */
+function lookup_(map, token) {
+  if (typeof token !== 'string' || !TOKEN_RE.test(token)) return null;
+  return Object.prototype.hasOwnProperty.call(map, token) ? map[token] : null;
 }
+
+function requireAdmin_(st, token) {
+  const exp = lookup_(st.admins, token);
+  if (typeof exp !== 'number' || exp < Date.now()) throw new Error('AUTH');
+}
+
+/* 連續輸錯密碼鎖定（防止暴力猜密碼） */
+function checkLock_(key) {
+  if (CacheService.getScriptCache().get('lock_' + key)) {
+    throw new Error('密碼錯誤次數過多，已暫時鎖定，請 10 分鐘後再試');
+  }
+}
+function fail_(key) {
+  const c = CacheService.getScriptCache();
+  const n = Number(c.get('fail_' + key) || 0) + 1;
+  if (n >= MAX_FAILS) {
+    c.put('lock_' + key, '1', LOCK_SEC);
+    c.remove('fail_' + key);
+  } else {
+    c.put('fail_' + key, String(n), LOCK_SEC);
+  }
+}
+function clearFails_(key) { CacheService.getScriptCache().remove('fail_' + key); }
 
 function admin_(st) {
   const base = screen_(st);
   const online = {};
-  Object.keys(st.tokens).forEach(function (t) { online[st.tokens[t]] = true; });
+  Object.keys(st.tokens).forEach(function (t) { if (TOKEN_RE.test(t)) online[st.tokens[t]] = true; });
   base.members = council_().map(function (m) {
     return {
       account: m.account, district: m.district, name: m.name,
@@ -326,6 +405,7 @@ function admin_(st) {
     };
   });
   base.history = history_();
+  base.integrity = integrity_(false);
   return base;
 }
 
@@ -333,7 +413,7 @@ function start_(st, req) {
   if (st.vote && st.vote.status === 'voting') throw new Error('已有進行中的表決');
   const members = council_();
   const eligible = members
-    .filter(function (m) { return st.attendance[m.account]; })
+    .filter(function (m) { return st.attendance[m.account] === true; })
     .map(function (m) { return m.account; });
   if (!eligible.length) throw new Error('目前沒有經確認出席的議員');
   const title = String(req.title || '').trim();
@@ -355,6 +435,8 @@ function start_(st, req) {
     total: members.length,
     votes: {}
   };
+  audit_('開始表決', st.vote.id + '　' + st.vote.title + '（' + (st.vote.named ? '記名' : '不記名') + '・' +
+    st.vote.rule + '・出席 ' + eligible.length + ' 人・' + seconds + ' 秒）', req.adminToken);
   return { ok: true };
 }
 
@@ -415,7 +497,7 @@ function result_(v, c) {
   return { text: '未通過', tone: 'fail', note: simple ? cmp : L.yes + ' ' + c.yes + ' 票，未達門檻 ' + need + ' 票' };
 }
 
-function closeVote_(st) {
+function closeVote_(st, reason, token) {
   const v = st.vote;
   if (!v || v.status !== 'voting') return;
   const c = tally_(v);
@@ -424,6 +506,7 @@ function closeVote_(st) {
   v.counts = c;
   v.result = result_(v, c);
   writeRecord_(v, c);
+  audit_(reason || '截止表決', v.id + '　結果：' + v.result.text, token || '');
   if (!v.named) delete v.votes; // 不記名：截止後立即刪除個別投票
 }
 
@@ -432,29 +515,111 @@ function writeRecord_(v, c) {
   const tz = Session.getScriptTimeZone();
   const f = function (t) { return Utilities.formatDate(new Date(t), tz, 'yyyy/MM/dd HH:mm:ss'); };
   const L = labels_(v.kind);
-  const log = ss.getSheetByName(SHEET_LOG);
-  log.appendRow([
-    safe_(v.id), f(v.startedAt), f(v.closedAt), safe_(v.billId), safe_(v.title), v.kind,
+  signedAppend_(ss.getSheetByName(SHEET_LOG), 'HEAD_LOG', [[
+    v.id, f(v.startedAt), f(v.closedAt), v.billId, v.title, v.kind,
     v.named ? '記名' : '不記名', v.rule, v.eligible.length, v.total,
     c.yes, c.no, v.kind === '人事案' ? '—' : c.abs, c.notVoted, v.result.text, v.result.note
-  ]);
+  ]]);
   if (v.named) {
-    const detail = ss.getSheetByName(SHEET_DETAIL);
     const rows = council_().map(function (m) {
       let s;
       if (v.eligible.indexOf(m.account) < 0) s = '未出席';
       else s = v.votes[m.account] ? L[v.votes[m.account]] : '未投票';
-      return [safe_(v.id), safe_(v.billId), safe_(v.title), m.district, m.name, s];
+      return [v.id, v.billId, v.title, m.district, m.name, s];
     });
-    if (rows.length) detail.getRange(detail.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
+    if (rows.length) signedAppend_(ss.getSheetByName(SHEET_DETAIL), 'HEAD_DETAIL', rows);
   }
   CacheService.getScriptCache().remove('history');
 }
 
-/** 避免文字被試算表當成公式或日期 */
-function safe_(s) {
-  s = String(s == null ? '' : s);
-  return /^[=+\-@]/.test(s) || /^\d/.test(s) ? "'" + s : s;
+/* ───────────── 防竄改簽章 ─────────────
+ * 每一列寫入時附上 HMAC-SHA256 簽章，並與上一列的簽章串連（類似區塊鏈）。
+ * 金鑰存在指令碼屬性（只有能編輯 Apps Script 的人看得到）。
+ * 事後在試算表裡修改任何一格、插入、刪除或調換列，驗證時都會被標出。 */
+
+function signKey_() {
+  const p = PropertiesService.getScriptProperties();
+  let k = p.getProperty('SIGN_KEY');
+  if (!k) { k = Utilities.getUuid() + Utilities.getUuid(); p.setProperty('SIGN_KEY', k); }
+  return k;
+}
+
+function sig_(prev, fields) {
+  const bytes = Utilities.computeHmacSha256Signature(prev + '\u241F' + fields.join('\u241F'), signKey_());
+  return Utilities.base64Encode(bytes).slice(0, 24);
+}
+
+/** 文字一律以純文字寫入（前置 '），確保讀回的內容與簽章時完全相同，也避免被當成公式 */
+function cell_(v) {
+  return typeof v === 'number' ? v : "'" + String(v == null ? '' : v);
+}
+
+function signedAppend_(sheet, headKey, rows) {
+  const props = PropertiesService.getScriptProperties();
+  const head = JSON.parse(props.getProperty(headKey) || '{"n":0,"sig":""}');
+  const width = rows[0].length;
+  if (sheet.getLastRow() >= 1 && !sheet.getRange(1, width + 1, 1, 1).getDisplayValues()[0][0]) {
+    sheet.getRange(1, width + 1, 1, 1).setValues([['簽章']]);   // 舊版試算表補上欄位
+  }
+  const out = rows.map(function (r) {
+    const fields = r.map(function (v) { return String(v == null ? '' : v); });
+    head.sig = sig_(head.sig, fields);
+    head.n++;
+    return r.map(cell_).concat([head.sig]);
+  });
+  sheet.getRange(sheet.getLastRow() + 1, 1, out.length, width + 1).setValues(out);
+  props.setProperty(headKey, JSON.stringify(head));
+  CacheService.getScriptCache().remove('integrity');
+}
+
+function verifySheet_(name, headKey, width) {
+  const sh = SpreadsheetApp.getActive().getSheetByName(name);
+  const head = JSON.parse(PropertiesService.getScriptProperties().getProperty(headKey) || '{"n":0,"sig":""}');
+  const res = { bad: [], legacy: 0, tail: false, rows: 0 };
+  const last = sh ? sh.getLastRow() : 0;
+  if (last >= 2) {
+    const vals = sh.getRange(2, 1, last - 1, width + 1).getDisplayValues();
+    let prev = '', started = false;
+    vals.forEach(function (r, i) {
+      const s = r[width];
+      if (!s && !started) { res.legacy++; return; }   // 加上簽章功能之前的舊紀錄
+      started = true;
+      res.rows++;
+      if (sig_(prev, r.slice(0, width)) !== s) res.bad.push(i + 2);
+      prev = s;
+    });
+    if (res.rows !== head.n || prev !== head.sig) res.tail = true;
+  } else if (head.n > 0) {
+    res.tail = true;
+  }
+  res.ok = !res.bad.length && !res.tail;
+  return res;
+}
+
+/** 檢查三張紀錄表；結果快取 60 秒 */
+function integrity_(force) {
+  const c = CacheService.getScriptCache();
+  if (!force) { const hit = c.get('integrity'); if (hit) return JSON.parse(hit); }
+  const r = {
+    log: verifySheet_(SHEET_LOG, 'HEAD_LOG', 16),
+    detail: verifySheet_(SHEET_DETAIL, 'HEAD_DETAIL', 6),
+    audit: verifySheet_(SHEET_AUDIT, 'HEAD_AUDIT', 4),
+    at: Date.now()
+  };
+  r.ok = r.log.ok && r.detail.ok && r.audit.ok;
+  c.put('integrity', JSON.stringify(r), 60);
+  return r;
+}
+
+/** 操作紀錄：誰（工作階段代碼）在何時做了什麼，同樣附簽章 */
+function audit_(action, detail, token) {
+  try {
+    const ss = SpreadsheetApp.getActive();
+    let sh = ss.getSheetByName(SHEET_AUDIT);
+    if (!sh) { ensureSheet_(ss, SHEET_AUDIT, ['時間', '操作', '內容', '工作階段', '簽章']); sh = ss.getSheetByName(SHEET_AUDIT); }
+    const t = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy/MM/dd HH:mm:ss');
+    signedAppend_(sh, 'HEAD_AUDIT', [[t, action, detail || '', token ? String(token).slice(0, 8) : '']]);
+  } catch (e) { /* 紀錄失敗不影響表決 */ }
 }
 
 /* ───────────── 公開畫面 ───────────── */
