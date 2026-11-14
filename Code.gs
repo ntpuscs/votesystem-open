@@ -204,7 +204,11 @@ function withLock_(fn) {
   lock.waitLock(15000);
   try {
     const st = loadState_();
-    if (st.vote && st.vote.status === 'voting' && Date.now() >= st.vote.endsAt) closeVote_(st, '時間到自動截止', '');
+    if (st.vote && st.vote.status === 'voting' && Date.now() >= st.vote.endsAt) {
+      closeVote_(st, '時間到自動截止', '');
+      // 截止結果已寫入試算表，必須立刻存檔；否則後面的 fn 拋錯時狀態不會儲存，下一個請求會再截止並重複寫入紀錄
+      saveState_(st);
+    }
     const out = fn(st);
     saveState_(st);
     return out;
@@ -493,7 +497,8 @@ function result_(v, c) {
   if (pass) {
     return { text: '通過', tone: 'pass', note: simple ? cmp : L.yes + ' ' + c.yes + ' 票，達門檻 ' + need + ' 票' };
   }
-  if (c.yes === c.no) return { text: '可否同數', tone: 'tie', note: '由主席裁決' };
+  // 只有簡單多數決才有「可否同數由主席裁決」；門檻制未達門檻即為未通過
+  if (simple && c.yes === c.no) return { text: '可否同數', tone: 'tie', note: '由主席裁決' };
   return { text: '未通過', tone: 'fail', note: simple ? cmp : L.yes + ' ' + c.yes + ' 票，未達門檻 ' + need + ' 票' };
 }
 
